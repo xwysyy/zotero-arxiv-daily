@@ -16,6 +16,7 @@ arxiv.Result._get_pdf_url = _get_pdf_url_patch
 import argparse
 import os
 import sys
+import time
 from dotenv import load_dotenv
 load_dotenv(override=True)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -70,8 +71,18 @@ def get_arxiv_paper(query:str, debug:bool=False) -> list[ArxivPaper]:
         all_paper_ids = [i.id.removeprefix("oai:arXiv.org:") for i in feed.entries if i.arxiv_announce_type == 'new']
         bar = tqdm(total=len(all_paper_ids),desc="Retrieving Arxiv papers")
         for i in range(0,len(all_paper_ids),20):
-            search = arxiv.Search(id_list=all_paper_ids[i:i+20])
-            batch = [ArxivPaper(p) for p in client.results(search)]
+            batch = []
+            for retry in range(3):
+                try:
+                    search = arxiv.Search(id_list=all_paper_ids[i:i+20])
+                    batch = [ArxivPaper(p) for p in client.results(search)]
+                    break
+                except arxiv.HTTPError as e:
+                    wait = 30 * (retry + 1)
+                    logger.warning(f"Failed to retrieve arxiv batch ({retry + 1}/3): {e}. Retrying in {wait}s.")
+                    time.sleep(wait)
+            if not batch:
+                logger.error("Skip current arxiv batch after repeated failures.")
             bar.update(len(batch))
             papers.extend(batch)
         bar.close()
@@ -197,4 +208,3 @@ if __name__ == '__main__':
     logger.info("Sending email...")
     send_email(args.sender, args.receiver, args.sender_password, args.smtp_server, args.smtp_port, html)
     logger.success("Email sent successfully! If you don't receive the email, please check the configuration and the junk box.")
-
