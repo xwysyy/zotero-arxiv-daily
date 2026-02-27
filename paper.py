@@ -5,6 +5,8 @@ import arxiv
 import tarfile
 import re
 import time
+import json
+import os
 from llm import get_llm
 import requests
 from requests.adapters import HTTPAdapter, Retry
@@ -12,6 +14,25 @@ from loguru import logger
 import tiktoken
 from contextlib import ExitStack
 from urllib.error import HTTPError
+
+PAPER_CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache", "papers")
+
+
+def _load_paper_cache(arxiv_id: str) -> dict:
+    path = os.path.join(PAPER_CACHE_DIR, f"{arxiv_id}.json")
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_paper_cache(arxiv_id: str, key: str, value):
+    os.makedirs(PAPER_CACHE_DIR, exist_ok=True)
+    path = os.path.join(PAPER_CACHE_DIR, f"{arxiv_id}.json")
+    data = _load_paper_cache(arxiv_id)
+    data[key] = value
+    with open(path, "w") as f:
+        json.dump(data, f, ensure_ascii=False)
 
 
 
@@ -52,6 +73,11 @@ class ArxivPaper:
     
     @cached_property
     def code_url(self) -> Optional[str]:
+        cache = _load_paper_cache(self.arxiv_id)
+        if "code_url" in cache:
+            logger.debug(f"Cache hit for code_url of {self.arxiv_id}")
+            return cache["code_url"]
+
         s = requests.Session()
         retries = Retry(total=5, backoff_factor=0.1)
         s.mount('https://', HTTPAdapter(max_retries=retries))
@@ -62,17 +88,22 @@ class ArxivPaper:
             return None
 
         if paper_list.get('count',0) == 0:
-            return None
-        paper_id = paper_list['results'][0]['id']
+            result = None
+        else:
+            paper_id = paper_list['results'][0]['id']
+            try:
+                repo_list = s.get(f'https://paperswithcode.com/api/v1/papers/{paper_id}/repositories/').json()
+            except Exception as e:
+                logger.debug(f'Error when searching {self.arxiv_id}: {e}')
+                result = None
+            else:
+                if repo_list.get('count',0) == 0:
+                    result = None
+                else:
+                    result = repo_list['results'][0]['url']
 
-        try:
-            repo_list = s.get(f'https://paperswithcode.com/api/v1/papers/{paper_id}/repositories/').json()
-        except Exception as e:
-            logger.debug(f'Error when searching {self.arxiv_id}: {e}')
-            return None
-        if repo_list.get('count',0) == 0:
-            return None
-        return repo_list['results'][0]['url']
+        _save_paper_cache(self.arxiv_id, "code_url", result)
+        return result
     
     @cached_property
     def tex(self) -> dict[str,str]:
@@ -162,6 +193,11 @@ class ArxivPaper:
     
     @cached_property
     def tldr(self) -> str:
+        cache = _load_paper_cache(self.arxiv_id)
+        if "tldr" in cache:
+            logger.debug(f"Cache hit for tldr of {self.arxiv_id}")
+            return cache["tldr"]
+
         introduction = ""
         conclusion = ""
         if self.tex is not None:
@@ -211,10 +247,17 @@ class ArxivPaper:
                 {"role": "user", "content": prompt},
             ]
         )
+        _save_paper_cache(self.arxiv_id, "tldr", tldr)
         return tldr
 
     @cached_property
     def affiliations(self) -> Optional[list[str]]:
+        cache = _load_paper_cache(self.arxiv_id)
+        if "affiliations" in cache:
+            logger.debug(f"Cache hit for affiliations of {self.arxiv_id}")
+            return cache["affiliations"]
+
+        result = None
         if self.tex is not None:
             content = self.tex.get("all")
             if content is None:
@@ -225,32 +268,32 @@ class ArxivPaper:
             match = next((m for m in matches if m), None)
             if match:
                 information_region = match.group(0)
+                prompt = f"Given the author information of a paper in latex format, extract the affiliations of the authors in a python list format, which is sorted by the author order. If there is no affiliation found, return an empty list '[]'. Following is the author information:\n{information_region}"
+                # use gpt-4o tokenizer for estimation
+                enc = tiktoken.encoding_for_model("gpt-4o")
+                prompt_tokens = enc.encode(prompt)
+                prompt_tokens = prompt_tokens[:4000]  # truncate to 4000 tokens
+                prompt = enc.decode(prompt_tokens)
+                llm = get_llm()
+                affiliations = llm.generate(
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are an assistant who perfectly extracts affiliations of authors from the author information of a paper. You should return a python list of affiliations sorted by the author order, like ['TsingHua University','Peking University']. If an affiliation is consisted of multi-level affiliations, like 'Department of Computer Science, TsingHua University', you should return the top-level affiliation 'TsingHua University' only. Do not contain duplicated affiliations. If there is no affiliation found, you should return an empty list [ ]. You should only return the final list of affiliations, and do not return any intermediate results.",
+                        },
+                        {"role": "user", "content": prompt},
+                    ]
+                )
+
+                try:
+                    affiliations = re.search(r'\[.*?\]', affiliations, flags=re.DOTALL).group(0)
+                    affiliations = eval(affiliations)
+                    affiliations = list(set(affiliations))
+                    result = [str(a) for a in affiliations]
+                except Exception as e:
+                    logger.debug(f"Failed to extract affiliations of {self.arxiv_id}: {e}")
             else:
                 logger.debug(f"Failed to extract affiliations of {self.arxiv_id}: No author information found.")
-                return None
-            prompt = f"Given the author information of a paper in latex format, extract the affiliations of the authors in a python list format, which is sorted by the author order. If there is no affiliation found, return an empty list '[]'. Following is the author information:\n{information_region}"
-            # use gpt-4o tokenizer for estimation
-            enc = tiktoken.encoding_for_model("gpt-4o")
-            prompt_tokens = enc.encode(prompt)
-            prompt_tokens = prompt_tokens[:4000]  # truncate to 4000 tokens
-            prompt = enc.decode(prompt_tokens)
-            llm = get_llm()
-            affiliations = llm.generate(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an assistant who perfectly extracts affiliations of authors from the author information of a paper. You should return a python list of affiliations sorted by the author order, like ['TsingHua University','Peking University']. If an affiliation is consisted of multi-level affiliations, like 'Department of Computer Science, TsingHua University', you should return the top-level affiliation 'TsingHua University' only. Do not contain duplicated affiliations. If there is no affiliation found, you should return an empty list [ ]. You should only return the final list of affiliations, and do not return any intermediate results.",
-                    },
-                    {"role": "user", "content": prompt},
-                ]
-            )
 
-            try:
-                affiliations = re.search(r'\[.*?\]', affiliations, flags=re.DOTALL).group(0)
-                affiliations = eval(affiliations)
-                affiliations = list(set(affiliations))
-                affiliations = [str(a) for a in affiliations]
-            except Exception as e:
-                logger.debug(f"Failed to extract affiliations of {self.arxiv_id}: {e}")
-                return None
-            return affiliations
+        _save_paper_cache(self.arxiv_id, "affiliations", result)
+        return result

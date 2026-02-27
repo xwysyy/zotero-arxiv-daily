@@ -14,6 +14,7 @@ def _get_pdf_url_patch(links) -> str:
 arxiv.Result._get_pdf_url = _get_pdf_url_patch
 
 import argparse
+import datetime
 import os
 import sys
 import time
@@ -167,6 +168,7 @@ if __name__ == '__main__':
         default="English",
     )
     parser.add_argument('--debug', action='store_true', help='Debug mode')
+    parser.add_argument('--no_cache', action='store_true', help='Ignore existing cache and recompute everything')
     args = parser.parse_args()
     assert (
         not args.use_llm_api or args.openai_api_key is not None
@@ -179,32 +181,45 @@ if __name__ == '__main__':
         logger.remove()
         logger.add(sys.stdout, level="INFO")
 
-    logger.info("Retrieving Zotero corpus...")
-    corpus = get_zotero_corpus(args.zotero_id, args.zotero_key)
-    logger.info(f"Retrieved {len(corpus)} papers from Zotero.")
-    if args.zotero_ignore:
-        logger.info(f"Ignoring papers in:\n {args.zotero_ignore}...")
-        corpus = filter_corpus(corpus, args.zotero_ignore)
-        logger.info(f"Remaining {len(corpus)} papers after filtering.")
-    logger.info("Retrieving Arxiv papers...")
-    papers = get_arxiv_paper(args.arxiv_query, args.debug)
-    if len(papers) == 0:
-        logger.info("No new papers found. Yesterday maybe a holiday and no one submit their work :). If this is not the case, please check the ARXIV_QUERY.")
-        if not args.send_empty:
-          exit(0)
-    else:
-        logger.info("Reranking papers...")
-        papers = rerank_paper(papers, corpus)
-        if args.max_paper_num != -1:
-            papers = papers[:args.max_paper_num]
-        if args.use_llm_api:
-            logger.info("Using OpenAI API as global LLM.")
-            set_global_llm(api_key=args.openai_api_key, base_url=args.openai_api_base, model=args.model_name, lang=args.language)
-        else:
-            logger.info("Using Local LLM as global LLM.")
-            set_global_llm(lang=args.language)
+    cache_dir = os.path.join(os.path.dirname(__file__), "cache")
+    cache_html_path = os.path.join(cache_dir, f"{datetime.date.today().isoformat()}.html")
 
-    html = render_email(papers)
+    if not args.no_cache and os.path.exists(cache_html_path):
+        logger.info(f"Found cached HTML for today: {cache_html_path}. Skipping fetch/rerank/render.")
+        with open(cache_html_path, "r") as f:
+            html = f.read()
+    else:
+        logger.info("Retrieving Zotero corpus...")
+        corpus = get_zotero_corpus(args.zotero_id, args.zotero_key)
+        logger.info(f"Retrieved {len(corpus)} papers from Zotero.")
+        if args.zotero_ignore:
+            logger.info(f"Ignoring papers in:\n {args.zotero_ignore}...")
+            corpus = filter_corpus(corpus, args.zotero_ignore)
+            logger.info(f"Remaining {len(corpus)} papers after filtering.")
+        logger.info("Retrieving Arxiv papers...")
+        papers = get_arxiv_paper(args.arxiv_query, args.debug)
+        if len(papers) == 0:
+            logger.info("No new papers found. Yesterday maybe a holiday and no one submit their work :). If this is not the case, please check the ARXIV_QUERY.")
+            if not args.send_empty:
+              exit(0)
+        else:
+            logger.info("Reranking papers...")
+            papers = rerank_paper(papers, corpus)
+            if args.max_paper_num != -1:
+                papers = papers[:args.max_paper_num]
+            if args.use_llm_api:
+                logger.info("Using OpenAI API as global LLM.")
+                set_global_llm(api_key=args.openai_api_key, base_url=args.openai_api_base, model=args.model_name, lang=args.language)
+            else:
+                logger.info("Using Local LLM as global LLM.")
+                set_global_llm(lang=args.language)
+
+        html = render_email(papers)
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(cache_html_path, "w") as f:
+            f.write(html)
+        logger.info(f"HTML cache saved to {cache_html_path}")
+
     logger.info("Sending email...")
     send_email(args.sender, args.receiver, args.sender_password, args.smtp_server, args.smtp_port, html)
     logger.success("Email sent successfully! If you don't receive the email, please check the configuration and the junk box.")
