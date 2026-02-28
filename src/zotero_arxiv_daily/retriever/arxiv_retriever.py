@@ -23,7 +23,11 @@ class ArxivRetriever(BaseRetriever):
         if 'Feed error for query' in feed.feed.title:
             raise Exception(f"Invalid ARXIV_QUERY: {query}.")
         raw_papers = []
-        all_paper_ids = [i.id.removeprefix("oai:arXiv.org:") for i in feed.entries if i.get("arxiv_announce_type","new") == 'new']
+        all_paper_ids = [
+            i.id.removeprefix("oai:arXiv.org:")
+            for i in feed.entries
+            if i.get("arxiv_announce_type", "new") in ("new", "cross")
+        ]
         if self.config.executor.debug:
             all_paper_ids = all_paper_ids[:10]
 
