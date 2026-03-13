@@ -11,6 +11,7 @@ from .construct_email import render_email
 from .utils import send_email
 from openai import OpenAI
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
 class Executor:
     def __init__(self, config:DictConfig):
         self.config = config
@@ -79,9 +80,13 @@ class Executor:
             reranked_papers = self.reranker.rerank(all_papers, corpus)
             reranked_papers = reranked_papers[:self.config.executor.max_paper_num]
             logger.info("Generating TLDR and affiliations...")
-            for p in tqdm(reranked_papers):
-                p.generate_tldr(self.openai_client, self.config.llm)
-                p.generate_affiliations(self.openai_client, self.config.llm)
+            def _process_paper(paper):
+                paper.generate_tldr(self.openai_client, self.config.llm)
+                paper.generate_affiliations(self.openai_client, self.config.llm)
+            with ThreadPoolExecutor(max_workers=self.config.executor.llm_workers) as pool:
+                futures = {pool.submit(_process_paper, p): i for i, p in enumerate(reranked_papers)}
+                for future in tqdm(as_completed(futures), total=len(reranked_papers), desc="Generating TLDR and affiliations"):
+                    future.result()
         elif not self.config.executor.send_empty:
             logger.info("No new papers found. No email will be sent.")
             return
