@@ -16,16 +16,22 @@ dependencies = [
     "aiosmtpd>=1.4.6",
     "loguru>=0.7.3",
     "pyzotero>=1.10.0",
-    "scikit-learn>=1.7.1",
-    "sentence-transformers>=5.2.3",
-    "torch",
+    "numpy>=1.26",
     "openai>=2.24.0",
     "arxiv>=2.4.0",
     "pymupdf4llm>=0.3.4",
     "pymupdf-layout>=1.27.1",
     "dotenv>=0.9.9",
-    "peft>=0.18.1",
+    "pysocks>=1.7.1",
     "trafilatura>=2.0.0",
+]
+
+[project.optional-dependencies]
+local = [
+    "scikit-learn>=1.7.1",
+    "sentence-transformers>=5.2.3",
+    "torch",
+    "peft>=0.18.1",
 ]
 
 [tool.uv.sources]

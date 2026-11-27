@@ -1,10 +1,13 @@
 """Tests for zotero_arxiv_daily.utils: glob_match, send_email, tex extraction."""
 
 import smtplib
+import socket
 import tarfile
 import io
+from unittest.mock import Mock, call
 
 import pytest
+import socks
 
 from zotero_arxiv_daily.utils import glob_match, send_email, extract_tex_code_from_tar, _bm25_pick
 from tests.canned_responses import make_stub_smtp
@@ -121,8 +124,13 @@ class TestGlobMatch:
 # ---------------------------------------------------------------------------
 
 
-def test_send_email_starttls_success(config, monkeypatch):
+@pytest.mark.parametrize("proxy", [None, "  "])
+def test_send_email_starttls_success(config, monkeypatch, proxy):
     sent = []
+    if proxy is None:
+        monkeypatch.delenv("SMTP_SOCKS5_PROXY", raising=False)
+    else:
+        monkeypatch.setenv("SMTP_SOCKS5_PROXY", proxy)
     monkeypatch.setattr(smtplib, "SMTP", make_stub_smtp(sent))
     send_email(config, "<html>hello</html>")
     assert len(sent) == 1
@@ -135,6 +143,7 @@ def test_send_email_starttls_success(config, monkeypatch):
 
 def test_send_email_falls_back_to_ssl(config, monkeypatch):
     sent = []
+    monkeypatch.delenv("SMTP_SOCKS5_PROXY", raising=False)
     call_count = {"smtp": 0}
 
     StubOK = make_stub_smtp(sent)
@@ -156,6 +165,7 @@ def test_send_email_falls_back_to_ssl(config, monkeypatch):
 
 def test_send_email_falls_back_to_plain(config, monkeypatch):
     sent = []
+    monkeypatch.delenv("SMTP_SOCKS5_PROXY", raising=False)
     call_count = {"smtp": 0}
 
     StubOK = make_stub_smtp(sent)
@@ -184,6 +194,65 @@ def test_send_email_falls_back_to_plain(config, monkeypatch):
     monkeypatch.setattr(smtplib, "SMTP_SSL", StubSMTP_SSL_Fails)
     send_email(config, "<html>plain</html>")
     assert len(sent) == 1
+
+
+@pytest.mark.parametrize(("proxy", "smtp_mode", "attempts"), [
+    ("  proxy.example:7891  ", "starttls", 1),
+    ("socks5://proxy.example:7891", "ssl", 2),
+    ("socks5h://proxy.example:7891", "plain", 3),
+])
+def test_send_email_routes_sockets_through_socks5(config, monkeypatch, proxy, smtp_mode, attempts):
+    proxy_socket = Mock()
+    proxy_socket.makefile.side_effect = lambda *args: io.BytesIO(b"220 ready\r\n")
+    connect = Mock(return_value=proxy_socket)
+    direct_connect = Mock(side_effect=AssertionError("unexpected direct SMTP connection"))
+    tls_context = Mock()
+    tls_context.wrap_socket.return_value = proxy_socket
+    if smtp_mode == "plain":
+        tls_context.wrap_socket.side_effect = OSError("SSL not supported")
+    starttls = Mock(side_effect=None if smtp_mode == "starttls" else OSError("STARTTLS not supported"))
+    sendmail = Mock()
+
+    monkeypatch.setenv("SMTP_SOCKS5_PROXY", proxy)
+    monkeypatch.setattr(socks, "create_connection", connect)
+    monkeypatch.setattr(socket, "create_connection", direct_connect)
+    monkeypatch.setattr(socket, "getfqdn", lambda: "localhost")
+    monkeypatch.setattr(smtplib.SMTP, "starttls", starttls)
+    monkeypatch.setattr(smtplib.ssl, "_create_stdlib_context", lambda: tls_context)
+    monkeypatch.setattr(smtplib.SMTP, "login", Mock())
+    monkeypatch.setattr(smtplib.SMTP, "sendmail", sendmail)
+    monkeypatch.setattr(smtplib.SMTP, "quit", Mock())
+
+    send_email(config, "<html>proxy</html>")
+
+    assert connect.call_args_list == [call(
+        (config.email.smtp_server, config.email.smtp_port),
+        timeout=socket.getdefaulttimeout(),
+        proxy_type=socks.SOCKS5,
+        proxy_addr="proxy.example",
+        proxy_port=7891,
+        proxy_rdns=True,
+    )] * attempts
+    direct_connect.assert_not_called()
+    if smtp_mode != "starttls":
+        tls_context.wrap_socket.assert_called_once_with(
+            proxy_socket, server_hostname=config.email.smtp_server,
+        )
+    sendmail.assert_called_once()
+
+
+@pytest.mark.parametrize("proxy", [
+    "proxy.example",
+    "proxy.example:0",
+    "proxy.example:65536",
+    "http://proxy.example:7891",
+    "socks5://user:pass@proxy.example:7891",
+    "socks5h://proxy.example:7891/path",
+])
+def test_send_email_rejects_invalid_socks5_proxy(config, monkeypatch, proxy):
+    monkeypatch.setenv("SMTP_SOCKS5_PROXY", proxy)
+    with pytest.raises(ValueError, match="SMTP_SOCKS5_PROXY"):
+        send_email(config, "<html>proxy</html>")
 
 
 # ---------------------------------------------------------------------------

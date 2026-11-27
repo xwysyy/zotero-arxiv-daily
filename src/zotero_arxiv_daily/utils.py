@@ -2,16 +2,20 @@ import tarfile
 import re
 import glob
 import math
+import os
 import smtplib
+import socket
 from collections import Counter
 from email.header import Header
 from email.mime.text import MIMEText
 from email.utils import parseaddr, formataddr
+from urllib.parse import urlsplit
 from loguru import logger
 import datetime
 from omegaconf import DictConfig
 import pymupdf
 import pymupdf.layout
+import socks
 pymupdf.TOOLS.mupdf_display_errors(False)
 pymupdf.layout.activate()
 
@@ -139,12 +143,56 @@ def glob_match(path:str, pattern:str) -> bool:
     re_pattern = glob.translate(pattern,recursive=True)
     return re.match(re_pattern, path) is not None
 
+def _parse_smtp_socks5_proxy(value: str) -> tuple[str, int]:
+    try:
+        address = urlsplit(value if "://" in value else f"socks5://{value}")
+        host, port = address.hostname, address.port
+        if (
+            address.scheme in ("socks5", "socks5h")
+            and host
+            and port
+            and address.username is None
+            and not address.path
+            and not address.query
+            and not address.fragment
+            and not any(char.isspace() for char in value)
+        ):
+            return host, port
+    except ValueError:
+        pass
+    raise ValueError("SMTP_SOCKS5_PROXY must be a host:port, socks5://host:port, or socks5h://host:port endpoint")
+
+
 def send_email(config:DictConfig, html:str):
     sender = config.email.sender
     receiver = config.email.receiver
     password = config.email.sender_password
     smtp_server = config.email.smtp_server
     smtp_port = config.email.smtp_port
+    smtp, smtp_ssl = smtplib.SMTP, smtplib.SMTP_SSL
+    proxy = os.environ.get("SMTP_SOCKS5_PROXY", "").strip()
+    if proxy:
+        proxy_host, proxy_port = _parse_smtp_socks5_proxy(proxy)
+
+        class SocksSMTP(smtplib.SMTP):
+            def _get_socket(self, host, port, timeout):
+                if timeout is socket._GLOBAL_DEFAULT_TIMEOUT:
+                    timeout = socket.getdefaulttimeout()
+                return socks.create_connection(
+                    (host, port),
+                    timeout=timeout,
+                    proxy_type=socks.SOCKS5,
+                    proxy_addr=proxy_host,
+                    proxy_port=proxy_port,
+                    proxy_rdns=True,
+                )
+
+        class SocksSMTPSSL(smtplib.SMTP_SSL, SocksSMTP):
+            # SMTP_SSL wraps the socket returned by super()._get_socket in TLS.
+            pass
+
+        smtp, smtp_ssl = SocksSMTP, SocksSMTPSSL
+
     def _format_addr(s):
         name, addr = parseaddr(s)
         return formataddr((Header(name, 'utf-8').encode(), addr))
@@ -156,15 +204,15 @@ def send_email(config:DictConfig, html:str):
     msg['Subject'] = Header(f'Daily arXiv {today}', 'utf-8').encode()
 
     try:
-        server = smtplib.SMTP(smtp_server, smtp_port)
+        server = smtp(smtp_server, smtp_port)
         server.starttls()
     except Exception as e:
         logger.debug(f"Failed to use TLS. {e}\nTry to use SSL.")
         try:
-            server = smtplib.SMTP_SSL(smtp_server, smtp_port)
+            server = smtp_ssl(smtp_server, smtp_port)
         except Exception as e:
             logger.debug(f"Failed to use SSL. {e}\nTry to use plain text.")
-            server = smtplib.SMTP(smtp_server, smtp_port)
+            server = smtp(smtp_server, smtp_port)
 
     server.login(sender, password)
     server.sendmail(sender, [receiver], msg.as_string())
