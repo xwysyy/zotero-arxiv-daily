@@ -4,7 +4,7 @@ import smtplib
 import socket
 import tarfile
 import io
-from unittest.mock import Mock, call
+from types import SimpleNamespace
 
 import pytest
 import socks
@@ -202,43 +202,53 @@ def test_send_email_falls_back_to_plain(config, monkeypatch):
     ("socks5h://proxy.example:7891", "plain", 3),
 ])
 def test_send_email_routes_sockets_through_socks5(config, monkeypatch, proxy, smtp_mode, attempts):
-    proxy_socket = Mock()
-    proxy_socket.makefile.side_effect = lambda *args: io.BytesIO(b"220 ready\r\n")
-    connect = Mock(return_value=proxy_socket)
-    direct_connect = Mock(side_effect=AssertionError("unexpected direct SMTP connection"))
-    tls_context = Mock()
-    tls_context.wrap_socket.return_value = proxy_socket
-    if smtp_mode == "plain":
-        tls_context.wrap_socket.side_effect = OSError("SSL not supported")
-    starttls = Mock(side_effect=None if smtp_mode == "starttls" else OSError("STARTTLS not supported"))
-    sendmail = Mock()
+    proxy_socket = SimpleNamespace(makefile=lambda *args: io.BytesIO(b"220 ready\r\n"))
+    connections = []
+    wrapped_sockets = []
+    sent = []
+
+    def connect(destination, **kwargs):
+        connections.append((destination, kwargs))
+        return proxy_socket
+
+    def direct_connect(*args, **kwargs):
+        pytest.fail("unexpected direct SMTP connection")
+
+    def wrap_socket(sock, *, server_hostname):
+        wrapped_sockets.append((sock, server_hostname))
+        if smtp_mode == "plain":
+            raise OSError("SSL not supported")
+        return sock
+
+    def starttls(server):
+        if smtp_mode != "starttls":
+            raise OSError("STARTTLS not supported")
 
     monkeypatch.setenv("SMTP_SOCKS5_PROXY", proxy)
     monkeypatch.setattr(socks, "create_connection", connect)
     monkeypatch.setattr(socket, "create_connection", direct_connect)
     monkeypatch.setattr(socket, "getfqdn", lambda: "localhost")
     monkeypatch.setattr(smtplib.SMTP, "starttls", starttls)
-    monkeypatch.setattr(smtplib.ssl, "_create_stdlib_context", lambda: tls_context)
-    monkeypatch.setattr(smtplib.SMTP, "login", Mock())
-    monkeypatch.setattr(smtplib.SMTP, "sendmail", sendmail)
-    monkeypatch.setattr(smtplib.SMTP, "quit", Mock())
+    monkeypatch.setattr(smtplib.ssl, "_create_stdlib_context", lambda: SimpleNamespace(wrap_socket=wrap_socket))
+    monkeypatch.setattr(smtplib.SMTP, "login", lambda *args: None)
+    monkeypatch.setattr(smtplib.SMTP, "sendmail", lambda server, *message: sent.append(message))
+    monkeypatch.setattr(smtplib.SMTP, "quit", lambda server: None)
 
     send_email(config, "<html>proxy</html>")
 
-    assert connect.call_args_list == [call(
+    assert connections == [(
         (config.email.smtp_server, config.email.smtp_port),
-        timeout=socket.getdefaulttimeout(),
-        proxy_type=socks.SOCKS5,
-        proxy_addr="proxy.example",
-        proxy_port=7891,
-        proxy_rdns=True,
+        {
+            "timeout": socket.getdefaulttimeout(),
+            "proxy_type": socks.SOCKS5,
+            "proxy_addr": "proxy.example",
+            "proxy_port": 7891,
+            "proxy_rdns": True,
+        },
     )] * attempts
-    direct_connect.assert_not_called()
-    if smtp_mode != "starttls":
-        tls_context.wrap_socket.assert_called_once_with(
-            proxy_socket, server_hostname=config.email.smtp_server,
-        )
-    sendmail.assert_called_once()
+    expected_wrapped = [] if smtp_mode == "starttls" else [(proxy_socket, config.email.smtp_server)]
+    assert wrapped_sockets == expected_wrapped
+    assert len(sent) == 1
 
 
 @pytest.mark.parametrize("proxy", [
